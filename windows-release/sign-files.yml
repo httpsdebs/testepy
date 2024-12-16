@@ -1,0 +1,86 @@
+parameters:
+  Include: '*'
+  Exclude: ''
+  Filter: ''
+  WorkingDir: '$(Build.BinariesDirectory)'
+  ExtractDir: ''
+  SigningCertificate: ''
+  ExportCommand: ''
+  ContinueOnError: false
+
+steps:
+- ${{ if parameters.SigningCertificate }}:
+  - powershell: |
+      dotnet tool install --global --prerelease sign
+      $signtool = (gcm sign).Source
+      $signargs = 'code trusted-signing -v Information ' + `
+        '-fd sha256 -t http://timestamp.acs.microsoft.com -td sha256 ' + `
+        '-tse "$(TrustedSigningUri)" -tsa "$(TrustedSigningAccount)" -tscp "$(TrustedSigningCertificateName)" ' + `
+        '-d "$(SigningDescription)" '
+
+      Write-Host "##vso[task.setvariable variable=__TrustedSigningCmd]$signtool"
+      Write-Host "##vso[task.setvariable variable=__TrustedSigningArgs]$signargs"
+      if ($env:EXPORT_COMMAND) {
+        $signcmd = """$signtool"" $signargs"
+        Write-Host "##vso[task.setvariable variable=${env:EXPORT_COMMAND}]$signcmd"
+      }
+    workingDirectory: $(Build.BinariesDirectory)
+    displayName: 'Install Trusted Signing tools'
+    env:
+      EXPORT_COMMAND: ${{ parameters.ExportCommand }}
+
+  - ${{ if parameters.Include }}:
+    - powershell: |
+        if ("${{ parameters.Exclude }}") {
+          $files = (dir ${{ parameters.Include }} -Exclude ${{ parameters.Exclude }} -File)
+        } else {
+          $files = (dir ${{ parameters.Include }} -File)
+        }
+        if ($env:FILTER) {
+          ($env:FILTER -split ';') -join "`n" | Out-File __filelist.txt -Encoding utf8
+        } else {
+          "*" | Out-File __filelist.txt -Encoding utf8
+        }
+        foreach ($f in $files) {
+          & $env:TRUSTED_SIGNING_CMD @(-split $env:TRUSTED_SIGNING_ARGS) -fl __filelist.txt $f
+          if (-not $?) { exit $LASTEXITCODE }
+        }
+        del __filelist.txt
+      displayName: 'Sign binaries'
+      ${{ if eq(parameters.ContinueOnError, 'false') }}:
+        retryCountOnTaskFailure: 3
+      ${{ else }}:
+        continueOnError: true
+      workingDirectory: ${{ parameters.WorkingDir }}
+      env:
+        TRUSTED_SIGNING_CMD: $(__TrustedSigningCmd)
+        TRUSTED_SIGNING_ARGS: $(__TrustedSigningArgs)
+        AZURE_TENANT_ID: $(TrustedSigningTenantId)
+        AZURE_CLIENT_ID: $(TrustedSigningClientId)
+        AZURE_CLIENT_SECRET: $(TrustedSigningSecret)
+        ${{ if parameters.Filter }}:
+          FILTER: ${{ parameters.Filter }}
+
+
+- ${{ if parameters.ExtractDir }}:
+  - powershell: |
+      if ("${{ parameters.Exclude }}") {
+        $files = (dir ${{ parameters.Include }} -Exclude ${{ parameters.Exclude }} -File)
+      } else {
+        $files = (dir ${{ parameters.Include }} -File)
+      }
+      $c = $files | %{ (Get-AuthenticodeSignature $_).SignerCertificate } | ?{ $_ -ne $null } | select -First 1
+      if (-not $c) {
+        Write-Host "Failed to find certificate for ${{ parameters.SigningCertificate }}"
+        exit
+      }
+
+      $d = mkdir "${{ parameters.ExtractDir }}" -Force
+      $cf = "$d\cert.cer"
+      [IO.File]::WriteAllBytes($cf, $c.RawData)
+      $csha = (Get-FileHash $cf -Algorithm SHA256).Hash.ToLower()
+
+      $info = @{ Subject=$c.Subject; SHA256=$csha; }
+      $info | ConvertTo-JSON -Compress | Out-File -Encoding utf8 "$d\certinfo.json"
+    displayName: "Extract certificate info"
+    workingDirectory: ${{ parameters.WorkingDir }}

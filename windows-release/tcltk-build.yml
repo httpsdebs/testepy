@@ -1,0 +1,134 @@
+parameters:
+- name: TclSourceTag
+  displayName: 'Tcl Source Tag'
+  type: string
+- name: TkSourceTag
+  displayName: 'Tk Source Tag'
+  type: string
+- name: IncludeTix
+  displayName: 'Include Tix (pre-3.13)'
+  type: boolean
+  default: false
+- name: TixSourceTag
+  displayName: 'Tix Source Tag'
+  type: string
+  default: tix-8.4.3.6
+- name: SigningCertificate
+  displayName: "Code signing certificate"
+  type: string
+  default: 'PythonSoftwareFoundation'
+  values:
+  - 'PythonSoftwareFoundation'
+  - 'TestSign'
+  - 'Unsigned'
+- name: SourcesRepo
+  displayName: 'Sources Repository'
+  type: string
+  default: 'https://github.com/python/cpython-source-deps'
+
+
+name: tcltk$(TkSourceTag)_$(Date:yyyyMMdd)$(Rev:.rr)
+
+
+resources:
+  repositories:
+  - repository: cpython
+    type: github
+    name: Python/cpython
+    endpoint: "Steve's github repos"
+
+
+variables:
+- ${{ if eq(parameters.SigningCertificate, 'PythonSoftwareFoundation') }}:
+  - group: CPythonSign
+- ${{ if eq(parameters.SigningCertificate, 'TestSign') }}:
+  - group: CPythonTestSign
+- name: IntDir
+  value: '$(Build.BinariesDirectory)\obj'
+- name: ExternalsDir
+  value: '$(Build.BinariesDirectory)\externals'
+- name: OutDir
+  value: '$(Build.ArtifactStagingDirectory)'
+- name: Configuration
+  value: 'Release'
+- name: SigningDescription
+  value: 'Tcl/Tk for Python (${{ parameters.TclSourceTag }})'
+- name: SourcesRepo
+  value: ${{ parameters.SourcesRepo }}
+- name: TclSourceTag
+  value: ${{ parameters.TclSourceTag }}
+- name: TkSourceTag
+  value: ${{ parameters.TkSourceTag }}
+- name: TixSourceTag
+  value: ${{ parameters.TixSourceTag }}
+
+
+jobs:
+- job: Build_TclTk
+  displayName: 'Tcl/Tk'
+  pool:
+    vmImage: windows-latest
+
+  workspace:
+    clean: all
+
+  steps:
+    - checkout: self
+    - checkout: cpython
+    - template: ./find-tools.yml
+
+    - powershell: |
+        git clone $(SourcesRepo) -b $(TclSourceTag) --depth 1 "$(ExternalsDir)\$(TclSourceTag)"
+      displayName: 'Check out Tcl sources'
+
+    - powershell: |
+        git clone $(SourcesRepo) -b $(TkSourceTag) --depth 1 "$(ExternalsDir)\$(TkSourceTag)"
+      displayName: 'Check out Tk sources'
+
+    - ${{ if eq(parameters.IncludeTix, 'true') }}:
+      - powershell: |
+          git clone $(SourcesRepo) -b $(TixSourceTag) --depth 1 "$(ExternalsDir)\$(TixSourceTag)"
+        displayName: 'Check out Tix sources'
+
+    # This msbuild.rsp file will be used by the build to forcibly override these variables
+    - powershell: |
+        del -Force -EA 0 msbuild.rsp
+        "/p:IntDir=$(IntDir)\" >> msbuild.rsp
+        "/p:ExternalsDir=$(ExternalsDir)\" >> msbuild.rsp
+        "/p:tclDir=$(ExternalsDir)\$(TclSourceTag)\" >> msbuild.rsp
+        "/p:tkDir=$(ExternalsDir)\$(TkSourceTag)\" >> msbuild.rsp
+        "/p:tixDir=$(ExternalsDir)\$(TixSourceTag)\" >> msbuild.rsp
+      displayName: 'Generate msbuild.rsp'
+
+    - powershell: |
+        & "$(msbuild)" cpython\PCbuild\tcl.vcxproj "@msbuild.rsp" /p:Platform=Win32 /p:tcltkDir="$(OutDir)\win32"
+        & "$(msbuild)" cpython\PCbuild\tk.vcxproj  "@msbuild.rsp" /p:Platform=Win32 /p:tcltkDir="$(OutDir)\win32"
+      displayName: 'Build for win32'
+
+    - powershell: |
+        & "$(msbuild)" cpython\PCbuild\tcl.vcxproj "@msbuild.rsp" /p:Platform=x64 /p:tcltkDir="$(OutDir)\amd64"
+        & "$(msbuild)" cpython\PCbuild\tk.vcxproj  "@msbuild.rsp" /p:Platform=x64 /p:tcltkDir="$(OutDir)\amd64"
+      displayName: 'Build for amd64'
+
+    - powershell: |
+        & "$(msbuild)" cpython\PCbuild\tcl.vcxproj "@msbuild.rsp" /p:Platform=ARM64 /p:tcltkDir="$(OutDir)\arm64"
+        & "$(msbuild)" cpython\PCbuild\tk.vcxproj  "@msbuild.rsp" /p:Platform=ARM64 /p:tcltkDir="$(OutDir)\arm64"
+      displayName: 'Build for arm64'
+
+    - ${{ if eq(parameters.IncludeTix, 'true') }}:
+      - powershell: |
+          & "$(msbuild)" cpython\PCbuild\tix.vcxproj "@msbuild.rsp" /p:Platform=Win32 /p:tcltkDir="$(OutDir)\win32"
+          & "$(msbuild)" cpython\PCbuild\tix.vcxproj "@msbuild.rsp" /p:Platform=x64 /p:tcltkDir="$(OutDir)\amd64"
+          & "$(msbuild)" cpython\PCbuild\tix.vcxproj "@msbuild.rsp" /p:Platform=ARM64 /p:tcltkDir="$(OutDir)\arm64"
+        displayName: 'Build Tix'
+
+    - ${{ if ne(parameters.SigningCertificate, 'Unsigned') }}:
+      - template: sign-files.yml
+        parameters:
+          Include: '-r *.dll'
+          WorkingDir: '$(OutDir)'
+          SigningCertificate: ${{ parameters.SigningCertificate }}
+
+    - publish: '$(OutDir)'
+      artifact: 'tcltk'
+      displayName: 'Publishing tcltk'

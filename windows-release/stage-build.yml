@@ -1,0 +1,325 @@
+parameters:
+  ARM64TclTk: true
+  DoPGO: false
+  # DoPGOARM64 only applies if DoPGO is also true
+  DoPGOARM64: true
+  DoFreethreaded: false
+
+jobs:
+- job: Build_Docs
+  displayName: Docs build
+  pool:
+    vmImage: windows-2022
+
+  workspace:
+    clean: all
+
+  steps:
+  - template: ./checkout.yml
+
+  - script: Doc\make.bat html
+    displayName: 'Build HTML docs'
+    env:
+      BUILDDIR: $(Build.BinariesDirectory)\Doc
+
+  - task: CopyFiles@2
+    displayName: 'Assemble artifact: Doc'
+    inputs:
+      sourceFolder: $(Build.BinariesDirectory)\Doc
+      targetFolder: $(Build.ArtifactStagingDirectory)\Doc
+      contents: |
+        html\**\*
+
+  - task: PublishPipelineArtifact@0
+    displayName: 'Publish artifact: doc'
+    inputs:
+      targetPath: $(Build.ArtifactStagingDirectory)\Doc
+      artifactName: doc
+
+
+- job: Build_Python
+  displayName: Python build
+
+  pool:
+    vmImage: windows-2022
+
+  workspace:
+    clean: all
+
+  strategy:
+    matrix:
+      win32:
+        Name: win32
+        Arch: win32
+        Platform: x86
+        Configuration: Release
+        _HostPython: .\python
+        ExtraOptions: ''
+      win32_d:
+        Name: win32_d
+        Arch: win32
+        Platform: x86
+        Configuration: Debug
+        _HostPython: .\python
+        ExtraOptions: ''
+      ${{ if ne(parameters.DoPGO, 'true') }}:
+        amd64:
+          Name: amd64
+          Arch: amd64
+          Platform: x64
+          Configuration: Release
+          _HostPython: .\python
+          ExtraOptions: ''
+      amd64_d:
+        Name: amd64_d
+        Arch: amd64
+        Platform: x64
+        Configuration: Debug
+        _HostPython: .\python
+        ExtraOptions: ''
+      ${{ if or(ne(parameters.DoPGO, 'true'), ne(parameters.DoPGOARM64, 'true')) }}:
+        arm64:
+          Name: arm64
+          Arch: arm64
+          Platform: ARM64
+          Configuration: Release
+          _HostPython: python
+          ExtraOptions: ''
+      arm64_d:
+        Name: arm64_d
+        Arch: arm64
+        Platform: ARM64
+        Configuration: Debug
+        _HostPython: python
+        ExtraOptions: ''
+      ${{ if eq(parameters.DoFreethreaded, 'true') }}:
+        win32_t:
+          Name: win32_t
+          Arch: win32
+          Platform: x86
+          Configuration: Release
+          _HostPython: .\python
+          ExtraOptions: --disable-gil
+        win32_td:
+          Name: win32_td
+          Arch: win32
+          Platform: x86
+          Configuration: Debug
+          _HostPython: .\python
+          ExtraOptions: --disable-gil
+        ${{ if ne(parameters.DoPGO, 'true') }}:
+          amd64_t:
+            Name: amd64_t
+            Arch: amd64
+            Platform: x64
+            Configuration: Release
+            _HostPython: .\python
+            ExtraOptions: --disable-gil
+        amd64_td:
+          Name: amd64_td
+          Arch: amd64
+          Platform: x64
+          Configuration: Debug
+          _HostPython: .\python
+          ExtraOptions: --disable-gil
+        ${{ if or(ne(parameters.DoPGO, 'true'), ne(parameters.DoPGOARM64, 'true')) }}:
+          arm64_t:
+            Name: arm64_t
+            Arch: arm64
+            Platform: ARM64
+            Configuration: Release
+            _HostPython: python
+            ExtraOptions: --disable-gil
+        arm64_td:
+          Name: arm64_td
+          Arch: arm64
+          Platform: ARM64
+          Configuration: Debug
+          _HostPython: python
+          ExtraOptions: --disable-gil
+
+  steps:
+    - template: ./build-steps.yml
+
+
+- ${{ if eq(parameters.DoPGO, 'true') }}:
+  - job: Build_Python_PGO_Native
+    displayName: Python PGO build
+
+    pool:
+      vmImage: windows-2022
+
+    workspace:
+      clean: all
+
+    strategy:
+      matrix:
+        amd64:
+          Name: amd64
+          Arch: amd64
+          Platform: x64
+          _HostPython: .\python
+          PythonExePattern: python.exe
+          ExtraOptions: ''
+        ${{ if eq(parameters.DoFreethreaded, 'true') }}:
+          amd64_t:
+            Name: amd64_t
+            Arch: amd64
+            Platform: x64
+            _HostPython: .\python
+            PythonExePattern: python3*t.exe
+            ExtraOptions: --disable-gil
+
+    steps:
+      - template: ./build-steps-pgo.yml
+        parameters:
+          PGInstrument: true
+          PGRun: true
+          PGUpdate: true
+
+  - ${{ if eq(parameters.DoPGOARM64, 'true') }}:
+    - job: Build_Python_PGO_1
+      displayName: Python PGO build
+
+      pool:
+        vmImage: windows-2022
+
+      workspace:
+        clean: all
+
+      variables:
+        Arch: arm64
+        Platform: ARM64
+        _HostPython: python
+
+      strategy:
+        matrix:
+          arm64:
+            Name: arm64
+            PythonExePattern: python.exe
+            ExtraOptions: ''
+          ${{ if eq(parameters.DoFreethreaded, 'true') }}:
+            arm64_t:
+              Name: arm64_t
+              PythonExePattern: python3*t.exe
+              ExtraOptions: --disable-gil
+
+      steps:
+        - template: ./build-steps-pgo.yml
+          parameters:
+            PGInstrument: true
+
+    - job: Build_Python_PGO_2
+      displayName: Collect PGO profile
+      dependsOn: Build_Python_PGO_1
+
+      # Allow up to five hours for PGO run
+      timeoutInMinutes: 300
+
+      pool:
+        name: 'Windows ARM64'
+
+      workspace:
+        clean: all
+
+      variables:
+        Arch: arm64
+        Platform: ARM64
+
+      strategy:
+        matrix:
+          arm64:
+            Name: arm64
+            PythonExePattern: python.exe
+          ${{ if eq(parameters.DoFreethreaded, 'true') }}:
+            arm64_t:
+              Name: arm64_t
+              PythonExePattern: python3*t.exe
+
+      steps:
+        - template: ./build-steps-pgo.yml
+          parameters:
+            PGRun: true
+
+    - job: Build_Python_PGO_3
+      displayName: Merge PGO profile
+      dependsOn: Build_Python_PGO_2
+
+      pool:
+        vmImage: windows-2022
+
+      workspace:
+        clean: all
+
+      variables:
+        Arch: arm64
+        Platform: ARM64
+        _HostPython: python
+
+      strategy:
+        matrix:
+          arm64:
+            Name: arm64
+            PythonExePattern: python.exe
+            ExtraOptions: ''
+          ${{ if eq(parameters.DoFreethreaded, 'true') }}:
+            arm64_t:
+              Name: arm64_t
+              PythonExePattern: python3*t.exe
+              ExtraOptions: --disable-gil
+
+      steps:
+        - template: ./build-steps-pgo.yml
+          parameters:
+            PGUpdate: true
+
+
+- job: TclTk_Lib
+  displayName: Publish Tcl/Tk Library
+
+  pool:
+    vmImage: windows-2022
+
+  workspace:
+    clean: all
+
+  steps:
+  - template: ./checkout.yml
+
+  - script: PCbuild\get_externals.bat --no-openssl --no-libffi
+    displayName: 'Get external dependencies'
+
+  - task: MSBuild@1
+    displayName: 'Copy Tcl/Tk lib for publish'
+    inputs:
+      solution: PCbuild\tcltk.props
+      platform: x86
+      msbuildArguments: /t:CopyTclTkLib /p:OutDir="$(Build.ArtifactStagingDirectory)\tcl_win32"
+
+  - task: MSBuild@1
+    displayName: 'Copy Tcl/Tk lib for publish'
+    inputs:
+      solution: PCbuild\tcltk.props
+      platform: x64
+      msbuildArguments: /t:CopyTclTkLib /p:OutDir="$(Build.ArtifactStagingDirectory)\tcl_amd64"
+
+  - ${{ if eq(parameters.ARM64TclTk, true) }}:
+    - task: MSBuild@1
+      displayName: 'Copy Tcl/Tk lib for publish'
+      inputs:
+        solution: PCbuild\tcltk.props
+        platform: ARM64
+        msbuildArguments: /t:CopyTclTkLib /p:OutDir="$(Build.ArtifactStagingDirectory)\tcl_arm64"
+
+  - publish: '$(Build.ArtifactStagingDirectory)\tcl_win32'
+    artifact: tcltk_lib_win32
+    displayName: 'Publish artifact: tcltk_lib_win32'
+
+  - publish: '$(Build.ArtifactStagingDirectory)\tcl_amd64'
+    artifact: tcltk_lib_amd64
+    displayName: 'Publish artifact: tcltk_lib_amd64'
+
+  - ${{ if eq(parameters.ARM64TclTk, true) }}:
+    - publish: '$(Build.ArtifactStagingDirectory)\tcl_arm64'
+      artifact: tcltk_lib_arm64
+      displayName: 'Publish artifact: tcltk_lib_arm64'

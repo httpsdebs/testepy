@@ -1,0 +1,85 @@
+jobs:
+- job: Make_Embed_Layout
+  displayName: Make embeddable layout
+  condition: and(succeeded(), eq(variables['DoEmbed'], 'true'))
+
+  pool:
+    vmImage: windows-2022
+
+  workspace:
+    clean: all
+
+  variables:
+    PYTHONHOME: $(Build.SourcesDirectory)
+
+  strategy:
+    matrix:
+      win32:
+        Name: win32
+        Arch: win32
+      amd64:
+        Name: amd64
+        Arch: amd64
+      arm64:
+        Name: arm64
+        Arch: arm64
+        HostArch: amd64
+
+  steps:
+  - template: ./checkout.yml
+
+  - download: current
+    artifact: bin_$(Name)
+    displayName: 'Download artifact: bin_$(Name)'
+
+  - template: ./layout-command.yml
+
+  - powershell: |
+      $d = (.\PCbuild\build.bat -V) | %{ if($_ -match '\s+(\w+):\s*(.+)\s*$') { @{$Matches[1] = $Matches[2];} }};
+      Write-Host "##vso[task.setvariable variable=VersionText]$($d.PythonVersion)"
+    displayName: 'Extract version numbers'
+
+  - powershell: >
+      $(LayoutCmd)
+      --copy "$(Build.ArtifactStagingDirectory)\layout"
+      --zip "$(Build.ArtifactStagingDirectory)\embed\python-$(VersionText)-embed-$(Name).zip"
+      --preset-embed
+    displayName: 'Generate embeddable layout'
+
+  - powershell: |
+      git clone $(Build.Repository.Uri) -b $(Build.SourceBranchName) --single-branch --no-checkout "$(Pipeline.Workspace)\release-tools"
+      git -C "$(Pipeline.Workspace)\release-tools" checkout $(Build.SourceVersion)
+    displayName: 'Clone the python/release-tools repository'
+
+  - powershell: >
+      & "$(Python)"
+      "$(Pipeline.Workspace)\release-tools\sbom.py"
+      "--cpython-source-dir=$(Build.SourcesDirectory)"
+      "$(Build.ArtifactStagingDirectory)\embed\python-$(VersionText)-embed-$(Name).zip"
+    workingDirectory: $(Build.BinariesDirectory)
+    displayName: 'Create SBOMs for binaries'
+
+  - task: CopyFiles@2
+    displayName: 'Layout Artifact: sbom'
+    inputs:
+      sourceFolder: $(Build.ArtifactStagingDirectory)\embed
+      targetFolder: $(Build.ArtifactStagingDirectory)\sbom
+      flatten: true
+      contents: |
+        **\*.spdx.json
+
+  - publish: '$(Build.ArtifactStagingDirectory)\layout'
+    artifact: layout_embed_$(Name)
+    displayName: 'Publish Artifact: layout_embed_$(Name)'
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish Artifact: embed'
+    inputs:
+      PathtoPublish: '$(Build.ArtifactStagingDirectory)\embed'
+      ArtifactName: embed
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish Artifact: sbom'
+    inputs:
+      PathtoPublish: '$(Build.ArtifactStagingDirectory)\sbom'
+      ArtifactName: sbom

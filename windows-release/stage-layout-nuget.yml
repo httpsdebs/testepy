@@ -1,0 +1,70 @@
+parameters:
+  DoFreethreaded: false
+
+jobs:
+- job: Make_Nuget_Layout
+  displayName: Make Nuget layout
+  condition: and(succeeded(), eq(variables['DoNuget'], 'true'))
+
+  pool:
+    vmImage: windows-2022
+
+  workspace:
+    clean: all
+
+  variables:
+    PYTHONHOME: $(Build.SourcesDirectory)
+
+  strategy:
+    matrix:
+      win32:
+        Name: win32
+        Arch: win32
+        ExtraOptions: ''
+      amd64:
+        Name: amd64
+        Arch: amd64
+        ExtraOptions: ''
+      arm64:
+        Name: arm64
+        Arch: arm64
+        HostArch: amd64
+        ExtraOptions: ''
+      ${{ if eq(parameters.DoFreethreaded, 'true') }}:
+        win32_t:
+          Name: win32_t
+          Arch: win32
+          HostArch: win32
+          ExtraOptions: --include-freethreaded
+        amd64_t:
+          Name: amd64_t
+          Arch: amd64
+          HostArch: amd64
+          ExtraOptions: --include-freethreaded
+        arm64_t:
+          Name: arm64_t
+          Arch: arm64
+          HostArch: amd64
+          ExtraOptions: --include-freethreaded
+
+  steps:
+  - template: ./checkout.yml
+
+  - download: current
+    artifact: bin_$(Name)
+    displayName: 'Download artifact: bin_$(Name)'
+
+  - powershell: |
+      copy $(Pipeline.Workspace)\bin_$(Name)\Activate.ps1 Lib\venv\scripts\common\Activate.ps1 -Force
+    displayName: 'Copy signed files into sources'
+    condition: and(succeeded(), variables['SigningCertificate'])
+
+  - template: ./layout-command.yml
+
+  - powershell: |
+      $(LayoutCmd) --copy "$(Build.ArtifactStagingDirectory)\nuget" --preset-nuget $(ExtraOptions)
+    displayName: 'Generate nuget layout'
+
+  - publish: '$(Build.ArtifactStagingDirectory)\nuget'
+    artifact: layout_nuget_$(Name)
+    displayName: 'Publish Artifact: layout_nuget_$(Name)'

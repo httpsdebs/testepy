@@ -1,0 +1,149 @@
+parameters:
+  DoFreethreaded: false
+  SigningCertificate: ''
+  Artifacts: []
+
+steps:
+  - template: ./checkout.yml
+
+  - powershell: |
+      $d = (.\PCbuild\build.bat -V) | %{ if($_ -match '\s+(\w+):\s*(.+)\s*$') { @{$Matches[1] = $Matches[2];} }};
+      Write-Host "##vso[task.setvariable variable=SigningDescription]Python $($d.PythonVersion)"
+    displayName: 'Update signing description'
+    condition: and(succeeded(), not(variables['SigningDescription']))
+
+  - ${{ each a in parameters.Artifacts }}:
+    - download: current
+      artifact: ${{ a.artifact }}
+      displayName: 'Download artifact: ${{ a.artifact }}'
+
+    - ${{ if a.target }}:
+      - task: CopyFiles@2
+        displayName: 'Move ${{ a.artifact }} files'
+        inputs:
+          sourceFolder: $(Pipeline.Workspace)\${{ a.artifact }}
+          targetFolder: ${{ a.target }}
+          overwrite: false
+
+  - ${{ if parameters.SigningCertificate }}:
+    - powershell: |
+        copy $(Py_OutDir)\amd64\Activate.ps1 Lib\venv\scripts\common\Activate.ps1 -Force
+      displayName: 'Copy signed files into sources'
+
+  - script: |
+      call Tools\msi\get_externals.bat
+      call PCbuild\find_python.bat
+      echo ##vso[task.setvariable variable=PYTHON]%PYTHON%
+      call PCbuild\find_msbuild.bat
+      echo ##vso[task.setvariable variable=MSBUILD]%MSBUILD%
+    displayName: 'Get external dependencies'
+
+  - script: |
+      %PYTHON% -m pip install blurb
+      %PYTHON% -m blurb merge -f Misc\NEWS
+    displayName: 'Merge NEWS file'
+
+  - powershell: |
+      ("/p:Py_OutDir=" + $env:BUILD_BINARIESDIRECTORY) | Out-File msbuild.rsp -Encoding UTF8
+      "/p:BuildForRelease=true" | Out-File msbuild.rsp -Append -Encoding UTF8
+      Write-Host "##vso[task.setvariable variable=ResponseFile]$(gi msbuild.rsp)"
+      gc msbuild.rsp
+    displayName: 'Generate response file'
+
+  - ${{ if eq(parameters.DoFreethreaded, 'true') }}:
+    - powershell: |
+        "/p:IncludeFreethreaded=true" | Out-File "$(ResponseFile)" -Append -Encoding UTF8
+        gc "$(ResponseFile)"
+      displayName: 'Add Include_freethreaded to response file'
+
+  - ${{ if parameters.SigningCertificate }}:
+    - template: sign-files.yml
+      parameters:
+        Include: ''
+        ExportCommand: SignCommand
+        SigningCertificate: ${{ parameters.SigningCertificate }}
+
+    - powershell: |
+        $cmd = $env:SignCommand -replace '"', '\"'
+        "/p:_SignCommand=""$cmd""" | Out-File $env:ResponseFile -Append -Encoding UTF8
+      displayName: 'Inject sign command into response file'
+      env:
+        SignCommand: $(SignCommand)
+        ResponseFile: $(ResponseFile)
+
+  - script: |
+      %MSBUILD% Tools\msi\launcher\launcher.wixproj "@$(ResponseFile)"
+    displayName: 'Build launcher installer'
+    env:
+      Platform: x86
+      ${{ if parameters.SigningCertificate }}:
+        AZURE_TENANT_ID: $(TrustedSigningTenantId)
+        AZURE_CLIENT_ID: $(TrustedSigningClientId)
+        AZURE_CLIENT_SECRET: $(TrustedSigningSecret)
+
+  - ${{ each b in parameters.Bundles }}:
+    - script: |
+        %MSBUILD% Tools\msi\bundle\releaselocal.wixproj /t:Rebuild /p:RebuildAll=true "@$(ResponseFile)"
+      displayName: 'Build ${{ b.bundle }} installer'
+      env:
+        Platform: ${{ b.Platform }}
+        PYTHON: $(Pipeline.Workspace)\${{ b.PythonForBuild }}\python.exe
+        PythonForBuild: $(Pipeline.Workspace)\${{ b.PythonForBuild }}\python.exe
+        PYTHONHOME: $(Build.SourcesDirectory)
+        ${{ if b.TclTkArtifact }}:
+          TclTkLibraryDir: $(Pipeline.Workspace)\${{ b.TclTkArtifact }}
+        ${{ if parameters.SigningCertificate }}:
+          AZURE_TENANT_ID: $(TrustedSigningTenantId)
+          AZURE_CLIENT_ID: $(TrustedSigningClientId)
+          AZURE_CLIENT_SECRET: $(TrustedSigningSecret)
+
+  - powershell: |
+      del $env:ResponseFile -ErrorAction Continue
+    displayName: 'Remove response file (always runs)'
+    condition: ne(variables['ResponseFile'], '')
+    env:
+      ResponseFile: $(ResponseFile)
+
+  - ${{ each b in parameters.Bundles }}:
+    - task: CopyFiles@2
+      displayName: 'Assemble artifact: msi (${{ b.bundle }})'
+      inputs:
+        sourceFolder: $(Build.BinariesDirectory)\${{ b.bundle }}\en-us
+        targetFolder: $(Build.ArtifactStagingDirectory)\msi\${{ b.bundle }}
+        contents: |
+          *.msi
+          *.cab
+          *.exe
+
+  - powershell: |
+      git clone $(Build.Repository.Uri) -b $(Build.SourceBranchName) --single-branch --no-checkout "$(Pipeline.Workspace)\release-tools"
+      git -C "$(Pipeline.Workspace)\release-tools" checkout $(Build.SourceVersion)
+    displayName: 'Clone the python/release-tools repository'
+
+  - powershell: >
+      & $(Python)
+      "$(Pipeline.Workspace)\release-tools\sbom.py"
+      "--cpython-source-dir=$(Build.SourcesDirectory)"
+      $(gci -r "$(Build.ArtifactStagingDirectory)\msi\**\python-*.exe")
+    workingDirectory: $(Build.BinariesDirectory)
+    displayName: 'Create SBOMs for binaries'
+
+  - task: CopyFiles@2
+    displayName: 'Layout Artifact: sbom'
+    inputs:
+      sourceFolder: $(Build.ArtifactStagingDirectory)\msi
+      targetFolder: $(Build.ArtifactStagingDirectory)\sbom
+      flatten: true
+      flattenFolders: true
+      contents: |
+        **\*.spdx.json
+
+  - publish: '$(Build.ArtifactStagingDirectory)\msi'
+    artifact: msi
+    displayName: 'Publish MSI'
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish Artifact: sbom'
+    inputs:
+      PathtoPublish: '$(Build.ArtifactStagingDirectory)\sbom'
+      ArtifactName: sbom

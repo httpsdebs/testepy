@@ -1,0 +1,109 @@
+parameters:
+- name: SourceTag
+  displayName: 'LibFFI Source Tag'
+  type: string
+- name: SigningCertificate
+  displayName: "Code signing certificate"
+  type: string
+  default: 'PythonSoftwareFoundation'
+  values:
+  - 'PythonSoftwareFoundation'
+  - 'TestSign'
+  - 'Unsigned'
+- name: SourcesRepo
+  displayName: 'Sources Repository'
+  type: string
+  default: 'https://github.com/python/cpython-source-deps'
+- name: LibFFIBuildScript
+  displayName: 'Build script'
+  type: string
+  default: 'https://github.com/python/cpython/raw/main/PCbuild/prepare_libffi.bat'
+
+
+name: ${{ parameters.SourceTag }}_$(Date:yyyyMMdd)$(Rev:.rr)
+
+
+variables:
+- ${{ if eq(parameters.SigningCertificate, 'PythonSoftwareFoundation') }}:
+  - group: CPythonSign
+- ${{ if eq(parameters.SigningCertificate, 'TestSign') }}:
+  - group: CPythonTestSign
+- name: IntDir
+  value: '$(Build.BinariesDirectory)'
+- name: OutDir
+  value: '$(Build.ArtifactStagingDirectory)'
+- name: SigningDescription
+  value: 'LibFFI for Python (${{ parameters.SourceTag }})'
+
+
+jobs:
+- job: Build_LibFFI
+  displayName: LibFFI
+  pool:
+    vmImage: windows-latest
+
+  workspace:
+    clean: all
+
+  steps:
+    - checkout: none
+
+    - template: ./find-tools.yml
+
+    - powershell: |
+       mkdir -Force "$(IntDir)\script"
+       iwr "${{ parameters.LibFFIBuildScript }}" -outfile "$(IntDir)\script\prepare_libffi.bat"
+      displayName: 'Download build script'
+
+    - powershell: |
+        git clone ${{ parameters.SourcesRepo }} -b ${{ parameters.SourceTag }} --depth 1 -c core.autocrlf=false -c core.eol=lf .
+      displayName: 'Check out LibFFI sources'
+
+    - script: 'prepare_libffi.bat --install-cygwin'
+      workingDirectory: '$(IntDir)\script'
+      displayName: 'Install Cygwin and build'
+      env:
+        VCVARSALL: '$(vcvarsall)'
+        LIBFFI_SOURCE: '$(Build.SourcesDirectory)'
+        LIBFFI_OUT: '$(OutDir)'
+
+    - powershell: |
+       if ((gci *\*.dll).Count -lt 3) {
+           Write-Error "Did not generate enough DLL files"
+       }
+       if ((gci *\Include\ffi.h).Count -lt 3) {
+           Write-Error "Did not generate enough include files"
+       }
+      failOnStderr: true
+      workingDirectory: '$(OutDir)'
+      displayName: 'Verify files were created'
+
+    - publish: '$(OutDir)'
+      artifact: 'unsigned'
+      displayName: 'Publish unsigned build'
+
+
+- ${{ if ne(parameters.SigningCertificate, 'Unsigned') }}:
+  - job: Sign_LibFFI
+    displayName: Sign LibFFI
+    dependsOn: Build_LibFFI
+    pool:
+      vmImage: windows-latest
+
+    workspace:
+      clean: all
+
+    steps:
+      - checkout: none
+      - download: current
+        artifact: unsigned
+
+      - template: sign-files.yml
+        parameters:
+          Include: '-r *.dll'
+          WorkingDir: '$(Pipeline.Workspace)\unsigned'
+          SigningCertificate: ${{ parameters.SigningCertificate }}
+
+      - publish: '$(Pipeline.Workspace)\unsigned'
+        artifact: 'libffi'
+        displayName: 'Publish libffi'
